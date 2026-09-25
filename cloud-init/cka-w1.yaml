@@ -1,0 +1,71 @@
+#cloud-config
+package_update: true
+packages:
+  - apt-transport-https
+  - ca-certificates
+  - curl
+  - gpg
+  - containerd
+  - jq
+  - bash-completion
+  - vim
+ssh_authorized_keys:
+  - ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMIKIvBDQiRHNF1tWuzifZ2Hnr0nd5w8c/4RSwKlxrm1 cka-lab
+write_files:
+  - path: /etc/netplan/60-cka-lab.yaml
+    permissions: '0600'
+    content: |
+      network:
+        version: 2
+        ethernets:
+          lab0:
+            match:
+              macaddress: "52:54:00:c4:a0:0b"
+            dhcp4: false
+            addresses: [192.168.100.11/24]
+            routes:
+              - to: default
+                via: 192.168.100.1
+                metric: 50
+            nameservers:
+              addresses: [1.1.1.1, 9.9.9.9]
+  - path: /etc/modules-load.d/k8s.conf
+    content: |
+      overlay
+      br_netfilter
+  - path: /etc/sysctl.d/99-k8s.conf
+    content: |
+      net.bridge.bridge-nf-call-iptables  = 1
+      net.bridge.bridge-nf-call-ip6tables = 1
+      net.ipv4.ip_forward                 = 1
+  - path: /etc/crictl.yaml
+    content: |
+      runtime-endpoint: unix:///run/containerd/containerd.sock
+      image-endpoint: unix:///run/containerd/containerd.sock
+  - path: /etc/hosts
+    append: true
+    content: |
+      192.168.100.10 cka-cp1
+      192.168.100.11 cka-w1
+      192.168.100.12 cka-w2
+
+runcmd:
+  - modprobe overlay
+  - modprobe br_netfilter
+  - sysctl --system
+  - netplan apply
+  - swapoff -a
+  - mkdir -p /etc/containerd
+  - containerd config default > /etc/containerd/config.toml
+  - sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
+  - systemctl restart containerd
+  - mkdir -p -m 755 /etc/apt/keyrings
+  - curl -fsSL https://pkgs.k8s.io/core:/stable:/v1.34/deb/Release.key | gpg --dearmor --yes -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+  - echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v1.34/deb/ /' > /etc/apt/sources.list.d/kubernetes.list
+  - apt-get update
+  - DEBIAN_FRONTEND=noninteractive apt-get install -y kubelet kubeadm kubectl
+  - apt-mark hold kubelet kubeadm kubectl
+  - echo 'KUBELET_EXTRA_ARGS=--node-ip=192.168.100.11' > /etc/default/kubelet
+  - systemctl enable --now kubelet
+  - DEBIAN_FRONTEND=noninteractive apt-get install -y etcd-client || true
+  - echo 'source <(kubectl completion bash); alias k=kubectl; complete -o default -F __start_kubectl k' >> /home/ubuntu/.bashrc
