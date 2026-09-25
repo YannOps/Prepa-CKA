@@ -1,4 +1,4 @@
-# Prepa-CKA
+﻿# Prepa-CKA
 
 Lab local et reproductible pour préparer la certification **CKA (Certified Kubernetes Administrator)** : un cluster `kubeadm` de 3 nœuds sur **Hyper-V + Multipass**, avec IP fixes, persistant au redémarrage de l'hôte, piloté depuis **VS Code**, et peuplé d'une charge réaliste alignée sur le programme de l'examen.
 
@@ -74,7 +74,7 @@ flowchart LR
 **1. Cloner le dépôt** (PowerShell **non admin**, le dossier cible doit être vide ou inexistant) :
 
 ```powershell
-git clone https://github.com/<ton-compte>/Prepa-CKA.git D:\cka
+git clone https://github.com/YannOps/Prepa-CKA.git D:\cka
 cd D:\cka
 git config core.hooksPath .githooks
 ```
@@ -232,7 +232,7 @@ Modifications faites **hors** de `D:\cka` : un bloc dans le fichier `hosts` de W
 
 - **Aucun secret n'est versionné.** La clé SSH, le kubeconfig et les cloud-init sont générés localement par `Create` et exclus par `.gitignore`. Un nouveau PC produit ses propres secrets.
 - **Hook `pre-commit`** : il bloque l'ajout de fichiers sensibles (`ssh/`, `kube/`, clés, `.pem`…) et de contenus de type clé privée ou certificat kubeconfig. Il s'active avec `git config core.hooksPath .githooks`, à refaire après chaque clone.
-- **Dépôt privé** : la protection de GitHub contre l'envoi de secrets ne couvre automatiquement que les dépôts publics. Le `.gitignore` et le hook sont donc la protection principale.
+- **Dépôt public** : la protection de GitHub contre l'envoi de secrets est active par défaut, mais ne détecte que les formats de secrets connus. Le `.gitignore` et le hook restent la protection principale.
 - **Droits NTFS** : `ssh\` et `kube\` sont restreints à l'utilisateur courant, SYSTEM et Administrateurs (condition exigée par OpenSSH pour Windows).
 - **Portée du lab** : `metrics-server` est configuré avec `--kubelet-insecure-tls` et les Secrets du seed contiennent des valeurs fictives. C'est acceptable pour un lab isolé, pas pour un environnement réel.
 - **En cas de fuite** : invalide d'abord le secret (supprimer `ssh\cka_lab_ed25519*`, ou `Destroy` puis `Create` pour régénérer les certificats), puis nettoie l'historique Git. Supprimer le fichier dans un nouveau commit ne suffit pas.
