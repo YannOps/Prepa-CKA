@@ -30,6 +30,10 @@ for v in LOCAL_PATH_VERSION METRICS_SERVER_VERSION TRAEFIK_CHART_VERSION PODINFO
   [ -n "${!v:-}" ] || { echo "${v} absent de ${VERSIONS_FILE}"; exit 1; }
 done
 
+# Delai max d'attente des deploiements : les images sont tirees a chaque seed et le NAT Hyper-V
+# peut tomber a ~100 Ko/s (Traefik 55 Mo = 9 min). Surchargeable : WAIT_TIMEOUT=30m bash cka-seed.sh
+WAIT_TIMEOUT="${WAIT_TIMEOUT:-15m}"
+
 SEED_DIR="${HOME}/manifests/seed"
 KUSTOMIZE_DIR="${HOME}/manifests/kustomize"
 mkdir -p "${SEED_DIR}" "${KUSTOMIZE_DIR}"
@@ -58,7 +62,7 @@ kubectl label node "${W2}" topology.kubernetes.io/zone=zone-b disk=hdd --overwri
 log "StorageClass dynamique : local-path-provisioner ${LOCAL_PATH_VERSION} (classe par defaut)"
 kubectl apply -f "https://raw.githubusercontent.com/rancher/local-path-provisioner/${LOCAL_PATH_VERSION}/deploy/local-path-storage.yaml" >/dev/null
 kubectl patch storageclass local-path -p '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}' >/dev/null
-kubectl -n local-path-storage rollout status deploy/local-path-provisioner --timeout=300s
+kubectl -n local-path-storage rollout status deploy/local-path-provisioner --timeout="${WAIT_TIMEOUT}"
 
 log "metrics-server ${METRICS_SERVER_VERSION}"
 kubectl apply -f "https://github.com/kubernetes-sigs/metrics-server/releases/download/${METRICS_SERVER_VERSION}/components.yaml" >/dev/null
@@ -67,7 +71,7 @@ if ! kubectl -n kube-system get deploy metrics-server -o jsonpath='{.spec.templa
   kubectl -n kube-system patch deploy metrics-server --type=json \
     -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--kubelet-insecure-tls"}]' >/dev/null
 fi
-kubectl -n kube-system rollout status deploy/metrics-server --timeout=300s
+kubectl -n kube-system rollout status deploy/metrics-server --timeout="${WAIT_TIMEOUT}"
 
 log "Helm : depots"
 helm repo add traefik https://traefik.github.io/charts --force-update >/dev/null
@@ -79,9 +83,10 @@ kubectl apply --server-side -f "https://github.com/kubernetes-sigs/gateway-api/r
 kubectl wait --for=condition=Established crd/gatewayclasses.gateway.networking.k8s.io crd/gateways.gateway.networking.k8s.io --timeout=120s >/dev/null
 
 log "Traefik ${TRAEFIK_CHART_VERSION} : IngressClass + Gateway API (NodePort 30080/30443)"
-# Une premiere installation echouee bloque 'helm upgrade --install' : on la retire avant de reessayer
-if helm status traefik -n traefik 2>/dev/null | grep -qiE 'STATUS: (failed|pending)'; then
-  warn "Release traefik en echec detectee : desinstallation avant nouvel essai"
+# Une release 'failed' (ex. timeout) se met a jour normalement avec 'helm upgrade --install' et garde
+# l'image deja tiree. Seul un etat 'pending-*' (seed interrompu) bloque Helm : on la retire alors.
+if helm status traefik -n traefik 2>/dev/null | grep -qiE 'STATUS: pending'; then
+  warn "Release traefik bloquee (pending) : desinstallation avant nouvel essai"
   helm uninstall traefik -n traefik --wait >/dev/null || true
 fi
 helm upgrade --install traefik traefik/traefik --version "${TRAEFIK_CHART_VERSION}" \
@@ -92,7 +97,7 @@ helm upgrade --install traefik traefik/traefik --version "${TRAEFIK_CHART_VERSIO
   --set service.spec.type=NodePort \
   --set ports.web.nodePort=30080 \
   --set ports.websecure.nodePort=30443 \
-  --wait --timeout 5m >/dev/null
+  --wait --timeout "${WAIT_TIMEOUT}" >/dev/null
 kubectl wait --for=condition=Established crd/httproutes.gateway.networking.k8s.io --timeout=120s >/dev/null
 kubectl wait --for=condition=Established crd/referencegrants.gateway.networking.k8s.io --timeout=120s >/dev/null
 
@@ -306,7 +311,7 @@ helm upgrade --install api podinfo/podinfo --version "${PODINFO_CHART_VERSION}" 
   --namespace backend \
   --set fullnameOverride=api \
   --set replicaCount=2 \
-  --wait --timeout 5m >/dev/null
+  --wait --timeout "${WAIT_TIMEOUT}" >/dev/null
 kubectl -n backend get svc api >/dev/null 2>&1 || warn "Service 'api' introuvable dans backend : verifie le nom genere par le chart (kubectl -n backend get svc)"
 
 cat > "${SEED_DIR}/20-backend.yaml" <<'EOF'
@@ -761,9 +766,9 @@ log "Attente des workloads"
 for target in "frontend deploy/web" "backend deploy/redis" "backend deploy/worker" "data statefulset/postgres" \
               "monitoring daemonset/node-agent" "team-a deploy/sandbox" "team-a deploy/archiver"; do
   set -- ${target}
-  kubectl -n "$1" rollout status "$2" --timeout=300s || warn "$1/$2 pas pret : kubectl -n $1 describe $2"
+  kubectl -n "$1" rollout status "$2" --timeout="${WAIT_TIMEOUT}" || warn "$1/$2 pas pret : kubectl -n $1 describe $2"
 done
-kubectl -n batch wait --for=condition=complete job/db-migrate-v42 --timeout=180s >/dev/null || warn "job db-migrate-v42 non termine"
+kubectl -n batch wait --for=condition=complete job/db-migrate-v42 --timeout="${WAIT_TIMEOUT}" >/dev/null || warn "job db-migrate-v42 non termine"
 
 log "Bilan"
 kubectl get ns --show-labels | grep -E 'team=|NAME' || true
