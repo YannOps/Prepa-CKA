@@ -1,9 +1,10 @@
 #!/bin/sh
 # Fichiers sensibles ajoutes/modifies (les suppressions sont autorisees)
-if git diff --cached --name-only --diff-filter=ACMR | grep -Ei '(^|/)(ssh|kube|logs|cloud-init)/|_ed25519|id_rsa|\.pem$|\.key$'; then
+if git diff --cached --name-only --diff-filter=ACMR | grep -Ei '(^|/)(ssh|kube|logs|cloud-init|runtime|\.terraform)/|_ed25519|id_rsa|\.pem$|\.key$|\.tfstate|\.tfvars$|\.tfplan$'; then
   echo "BLOQUE : fichier sensible dans l'index"; exit 1
 fi
 # Secrets dans les lignes ajoutees (.githooks exclu : il contient les motifs eux-memes)
-if git diff --cached -U0 --diff-filter=ACMR -- . ':(exclude).githooks' | grep -E '^\+' | grep -E 'BEGIN [A-Z ]*PRIVATE KEY|client-key-data|client-certificate-data|token:'; then
+# Dernier motif : jeton Hetzner (64 caracteres alphanumeriques) affecte a une variable *token*
+if git diff --cached -U0 --diff-filter=ACMR -- . ':(exclude).githooks' | grep -E '^\+' | grep -E 'BEGIN [A-Z ]*PRIVATE KEY|client-key-data|client-certificate-data|token:|([Tt]oken|TOKEN)[^A-Za-z0-9]{1,4}[A-Za-z0-9]{64}'; then
   echo "BLOQUE : secret detecte dans le contenu"; exit 1
 fi

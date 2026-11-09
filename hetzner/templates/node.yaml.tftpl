@@ -1,0 +1,38 @@
+#cloud-config
+# Noeud Kubernetes du lab CKA (Hetzner) : aucune IP publique, sortie Internet via le NAT du bastion.
+# Tout ce qui concerne Kubernetes est dans /opt/cka/bootstrap-node.sh, commun avec le lab Hyper-V.
+users:
+  - name: ubuntu
+    groups: [sudo]
+    shell: /bin/bash
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    lock_passwd: true
+    ssh_authorized_keys:
+      - ${ssh_public_key}
+# A chaque demarrage, avant tout acces reseau : route par defaut vers la passerelle du reseau Hetzner,
+# qui renvoie le trafic Internet au bastion (route 0.0.0.0/0 du reseau prive).
+bootcmd:
+  - [sh, -c, "for i in $(seq 1 30); do ip -4 -o addr show | grep -q ' ${node_ip}/' && break; sleep 2; done; ip route replace default via ${network_gateway} || true"]
+write_files:
+  - path: /etc/ssh/sshd_config.d/10-cka-hardening.conf
+    content: |
+      ${indent(6, sshd_hardening)}
+  # Resolveurs DNS Hetzner (joints via le NAT du bastion)
+  - path: /etc/systemd/resolved.conf.d/10-cka.conf
+    content: |
+      [Resolve]
+      DNS=185.12.64.1 185.12.64.2
+  - path: /etc/hosts
+    append: true
+    content: |
+      ${indent(6, hosts_entries)}
+%{ for name, b64 in files ~}
+  - path: /opt/cka/${name}
+    permissions: '${endswith(name, ".sh") ? "0755" : "0644"}'
+    encoding: b64
+    content: ${b64}
+%{ endfor ~}
+runcmd:
+  - systemctl restart systemd-resolved
+  - systemctl restart ssh
+  - [bash, /opt/cka/bootstrap-node.sh, "${node_ip}"]

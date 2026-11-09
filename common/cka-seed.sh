@@ -18,11 +18,17 @@
 # =============================================================================
 set -euo pipefail
 
-LOCAL_PATH_VERSION="v0.0.37"
-METRICS_SERVER_VERSION="v0.9.0"
-TRAEFIK_CHART_VERSION="41.6.0"
-PODINFO_CHART_VERSION="6.15.0"
-GATEWAY_API_VERSION="v1.6.1"    # version indiquee par la doc Traefik v3.7 (chart 41.6.0 = Traefik v3.7.13)
+# Versions : source unique common/versions.env (copiee a cote du script, ou deposee dans /opt/cka par le cloud-init)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VERSIONS_FILE="${SCRIPT_DIR}/versions.env"
+[ -f "${VERSIONS_FILE}" ] || VERSIONS_FILE=/opt/cka/versions.env
+[ -f "${VERSIONS_FILE}" ] || { echo "versions.env introuvable (ni a cote du script, ni dans /opt/cka)"; exit 1; }
+# shellcheck source=versions.env
+. "${VERSIONS_FILE}"
+# GATEWAY_API_VERSION : version indiquee par la doc Traefik v3.7 (chart 41.6.0 = Traefik v3.7.13)
+for v in LOCAL_PATH_VERSION METRICS_SERVER_VERSION TRAEFIK_CHART_VERSION PODINFO_CHART_VERSION GATEWAY_API_VERSION; do
+  [ -n "${!v:-}" ] || { echo "${v} absent de ${VERSIONS_FILE}"; exit 1; }
+done
 
 SEED_DIR="${HOME}/manifests/seed"
 KUSTOMIZE_DIR="${HOME}/manifests/kustomize"
@@ -35,7 +41,7 @@ apply_file() { kubectl apply -f "$1" >/dev/null && echo "  applique : $(basename
 # ----------------------------------------------------------------- prerequis
 log "Verification des prerequis"
 command -v kubectl >/dev/null || { echo "kubectl introuvable"; exit 1; }
-command -v helm    >/dev/null || { echo "helm introuvable (sudo snap install helm --classic)"; exit 1; }
+command -v helm    >/dev/null || { echo "helm introuvable (installe par /opt/cka/init-cp.sh)"; exit 1; }
 kubectl get nodes >/dev/null || { echo "kubectl ne joint pas le cluster"; exit 1; }
 
 mapfile -t WORKERS < <(kubectl get nodes -l '!node-role.kubernetes.io/control-plane' -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | sort)
@@ -777,5 +783,7 @@ Termine. Tests rapides :
   curl -H 'Host: legacy.shop.local' http://${NODE_IP}:30080/        # Ingress -> web
   kubectl top nodes                                                 # metrics-server (~1 min apres install)
   kubectl get bk -A                                                 # custom resources
-Pense au snapshot depuis Windows :  .\\cka-lab.ps1 -Action Snapshot -SnapshotName seeded
+Etat de reference :
+  Hyper-V : .\\hyperv\\cka-lab.ps1 -Action Snapshot -SnapshotName seeded  (fait automatiquement par -Action Seed)
+  Hetzner : lab ephemere, recreer avec ./hetzner/cka-hetzner.sh create && ./hetzner/cka-hetzner.sh seed
 EOF

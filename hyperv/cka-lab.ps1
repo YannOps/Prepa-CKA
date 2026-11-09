@@ -14,25 +14,26 @@
   - Hors de LabRoot (inevitable) : 1 bloc dans hosts Windows, 1 ligne Include dans ~/.ssh/config,
     vSwitch/NAT Hyper-V, tache planifiee, variable systeme MULTIPASS_STORAGE
   - Snapshot / Restore pour s'entraîner à casser/réparer le cluster
+  - Versions (Ubuntu, Kubernetes, Calico, Helm, composants du seed) : source unique ..\common\versions.env,
+    partagee avec le lab Hetzner. La preparation des noeuds (common\bootstrap-node.sh) et l'init du
+    control-plane (common\init-cp.sh) sont aussi communes aux deux labs.
 
 .EXAMPLE
-  .\cka-lab.ps1 -Action Create
-  .\cka-lab.ps1 -Action Status
-  .\cka-lab.ps1 -Action Snapshot -SnapshotName avant-upgrade
-  .\cka-lab.ps1 -Action Restore  -SnapshotName clean
-  .\cka-lab.ps1 -Action Destroy
-  .\cka-lab.ps1 -Action ResetStorage   # remet le stockage Multipass par defaut (C:\ProgramData\Multipass)
+  .\hyperv\cka-lab.ps1 -Action Create
+  .\hyperv\cka-lab.ps1 -Action Seed                     # charge realiste + snapshot 'seeded'
+  .\hyperv\cka-lab.ps1 -Action Status
+  .\hyperv\cka-lab.ps1 -Action Snapshot -SnapshotName avant-upgrade
+  .\hyperv\cka-lab.ps1 -Action Restore  -SnapshotName clean
+  .\hyperv\cka-lab.ps1 -Action RegisterTask             # (re)enregistre la tache de demarrage
+  .\hyperv\cka-lab.ps1 -Action Destroy
+  .\hyperv\cka-lab.ps1 -Action ResetStorage   # remet le stockage Multipass par defaut (C:\ProgramData\Multipass)
 #>
 [CmdletBinding()]
 param(
-    [ValidateSet('Create','Status','Snapshot','Restore','Repair','Destroy','ResetStorage')]
+    [ValidateSet('Create','Seed','Status','Snapshot','Restore','Repair','RegisterTask','Destroy','ResetStorage')]
     [string]$Action        = 'Create',
-    [string]$K8sMinor      = '1.34',        # examen = 1.35 -> 1.34 pour s'entrainer a l'upgrade
-    [string]$CalicoVersion = 'v3.31.4',
-    [string]$UbuntuImage   = '24.04',
     [string]$SwitchName    = 'CKA-Lab',
     [string]$NetPrefix     = '192.168.100', # /24 ; ne doit pas chevaucher ton LAN / VPN
-    [string]$PodCidr       = '10.244.0.0/16',
     [string]$SnapshotName  = 'clean',
     [string]$LabRoot       = 'D:\cka',
     # Stockage Multipass = reglage GLOBAL (un seul par hote, partage par TOUTES les instances) :
@@ -57,6 +58,11 @@ $LogDir     = Join-Path $LabRoot 'logs'
 $MpStorage  = [IO.Path]::GetFullPath($MultipassStorage).TrimEnd('\')
 $MpRegPath  = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment'
 $TaskName = 'CKA-Lab-Repair'
+# Copie du script executee par la tache planifiee : hors des fichiers suivis par Git, donc independante
+# de la branche courante du depot.
+$RuntimeDir = Join-Path $LabRoot 'runtime'
+# Fichiers communs aux deux labs (le script vit dans <depot>\hyperv)
+$CommonDir  = Join-Path (Split-Path $PSScriptRoot -Parent) 'common'
 
 # Dimensionnement : kubeadm exige >= 2 vCPU / 2 Go pour le control-plane
 $Nodes = @(
@@ -69,18 +75,10 @@ $Cp        = $Nodes | Where-Object { $_.Role -eq 'cp' } | Select-Object -First 1
 $Workers   = $Nodes | Where-Object { $_.Role -eq 'worker' }
 
 # ---------------------------------------------------------------- templates
+# Specifique a Hyper-V : interface du lab reconnue par son adresse MAC, IP fixe, route par defaut via WinNAT.
+# Tout le reste (noyau, containerd, paquets Kubernetes, kubelet) est dans common\bootstrap-node.sh.
 $CloudInitTemplate = @'
 #cloud-config
-package_update: true
-packages:
-  - apt-transport-https
-  - ca-certificates
-  - curl
-  - gpg
-  - containerd
-  - jq
-  - bash-completion
-  - vim
 ssh_authorized_keys:
   - __PUBKEY__
 write_files:
@@ -101,93 +99,20 @@ write_files:
                 metric: 50
             nameservers:
               addresses: [1.1.1.1, 9.9.9.9]
-  - path: /etc/modules-load.d/k8s.conf
-    content: |
-      overlay
-      br_netfilter
-  - path: /etc/sysctl.d/99-k8s.conf
-    content: |
-      net.bridge.bridge-nf-call-iptables  = 1
-      net.bridge.bridge-nf-call-ip6tables = 1
-      net.ipv4.ip_forward                 = 1
-  - path: /etc/crictl.yaml
-    content: |
-      runtime-endpoint: unix:///run/containerd/containerd.sock
-      image-endpoint: unix:///run/containerd/containerd.sock
   - path: /etc/hosts
     append: true
     content: |
 __HOSTS__
-__CP_FILES__
+__CKA_FILES__
 runcmd:
-  - modprobe overlay
-  - modprobe br_netfilter
-  - sysctl --system
   - netplan apply
-  - swapoff -a
-  - mkdir -p /etc/containerd
-  - containerd config default > /etc/containerd/config.toml
-  - sed -i 's/SystemdCgroup = false/SystemdCgroup = true/' /etc/containerd/config.toml
-  - systemctl restart containerd
-  - mkdir -p -m 755 /etc/apt/keyrings
-  - curl -fsSL https://pkgs.k8s.io/core:/stable:/v__K8S__/deb/Release.key | gpg --dearmor --yes -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
-  - echo 'deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v__K8S__/deb/ /' > /etc/apt/sources.list.d/kubernetes.list
-  - apt-get update
-  - DEBIAN_FRONTEND=noninteractive apt-get install -y kubelet kubeadm kubectl
-  - apt-mark hold kubelet kubeadm kubectl
-  - echo 'KUBELET_EXTRA_ARGS=--node-ip=__IP__' > /etc/default/kubelet
-  - systemctl enable --now kubelet
-  - DEBIAN_FRONTEND=noninteractive apt-get install -y etcd-client || true
-  - echo 'source <(kubectl completion bash); alias k=kubectl; complete -o default -F __start_kubectl k' >> /home/ubuntu/.bashrc
+  - [bash, /opt/cka/bootstrap-node.sh, "__IP__"]
 '@
 
-# Fichiers supplementaires pour le control-plane (inseres dans write_files)
-$CpFilesTemplate = @'
-  - path: /usr/local/sbin/cka-init-cp.sh
-    permissions: '0755'
-    content: |
-      #!/usr/bin/env bash
-      set -euo pipefail
-      if [ -f /etc/kubernetes/admin.conf ]; then echo "control-plane deja initialise"; exit 0; fi
-      kubeadm init \
-        --apiserver-advertise-address=__IP__ \
-        --control-plane-endpoint=__IP__:6443 \
-        --pod-network-cidr=__PODCIDR__ \
-        --node-name="$(hostname)"
-      mkdir -p /home/ubuntu/.kube
-      cp /etc/kubernetes/admin.conf /home/ubuntu/.kube/config
-      chown -R ubuntu:ubuntu /home/ubuntu/.kube
-      export KUBECONFIG=/etc/kubernetes/admin.conf
-      kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/__CALICO__/manifests/operator-crds.yaml
-      kubectl create -f https://raw.githubusercontent.com/projectcalico/calico/__CALICO__/manifests/tigera-operator.yaml
-      kubectl wait --for=condition=Established crd/installations.operator.tigera.io --timeout=180s
-      kubectl create -f /root/calico-installation.yaml
-      snap install helm --classic || true
-  - path: /root/calico-installation.yaml
-    content: |
-      apiVersion: operator.tigera.io/v1
-      kind: Installation
-      metadata:
-        name: default
-      spec:
-        calicoNetwork:
-          ipPools:
-            - name: default-ipv4-ippool
-              blockSize: 26
-              cidr: __PODCIDR__
-              encapsulation: VXLAN
-              natOutgoing: Enabled
-              nodeSelector: all()
-          nodeAddressAutodetectionV4:
-            cidrs:
-              - "__LABCIDR__"
-      ---
-      apiVersion: operator.tigera.io/v1
-      kind: APIServer
-      metadata:
-        name: default
-      spec: {}
-'@
+# Fichiers communs deposes dans /opt/cka sur chaque noeud (init-cp.sh sur le control-plane seulement).
+# Encodes en base64 : aucun risque d'indentation YAML ni de fin de ligne Windows.
+$CommonNodeFiles = @('versions.env', 'bootstrap-node.sh', 'show-versions.sh')
+$CommonCpFiles   = @('init-cp.sh')
 
 # ---------------------------------------------------------------- helpers
 # PowerShell 5.1 + ErrorActionPreference=Stop transforme tout texte ecrit sur stderr par un exe
@@ -208,6 +133,32 @@ function Get-MpOutput {
 
 function Write-Utf8NoBom([string]$Path, [string]$Text) {
     [IO.File]::WriteAllText($Path, ($Text -replace "`r`n", "`n"), (New-Object Text.UTF8Encoding($false)))
+}
+
+# Lit common\versions.env (CLE=valeur) : meme fichier que le lab Hetzner, donc memes versions.
+function Get-LabVersions {
+    $file = Join-Path $CommonDir 'versions.env'
+    if (-not (Test-Path $file)) { throw "Fichier de versions introuvable : $file (le script doit rester dans <depot>\hyperv)" }
+    $v = @{}
+    foreach ($line in [IO.File]::ReadAllLines($file)) {
+        if ($line -match '^\s*([A-Z0-9_]+)=(\S+)\s*$') { $v[$Matches[1]] = $Matches[2] }
+    }
+    foreach ($k in 'UBUNTU_VERSION', 'K8S_VERSION', 'CALICO_VERSION', 'HELM_VERSION') {
+        if (-not $v[$k]) { throw "$k absent de $file" }
+    }
+    $v
+}
+
+# Bloc write_files YAML : fichiers communs encodes en base64, deposes dans /opt/cka
+function Get-CommonFilesYaml([string[]]$Names) {
+    ($Names | ForEach-Object {
+        $src = Join-Path $CommonDir $_
+        if (-not (Test-Path $src)) { throw "Fichier commun introuvable : $src" }
+        $text = [IO.File]::ReadAllText($src) -replace "`r`n", "`n"
+        $b64  = [Convert]::ToBase64String((New-Object Text.UTF8Encoding($false)).GetBytes($text))
+        $perm = if ($_ -like '*.sh') { '0755' } else { '0644' }
+        "  - path: /opt/cka/$_`n    permissions: '$perm'`n    encoding: b64`n    content: $b64"
+    }) -join "`n"
 }
 
 function Get-NodeMac([string]$Ip) {
@@ -471,20 +422,19 @@ function Ensure-SshKey {
 
 function New-CloudInit($n, [string]$pub) {
     $hosts = ($Nodes | ForEach-Object { "      $($_.Ip) $($_.Name)" }) -join "`n"
-    $cpFiles = if ($n.Role -eq 'cp') { $CpFilesTemplate } else { '' }
-    $CloudInitTemplate.Replace('__CP_FILES__', $cpFiles).
+    $names = if ($n.Role -eq 'cp') { $CommonNodeFiles + $CommonCpFiles } else { $CommonNodeFiles }
+    $CloudInitTemplate.Replace('__CKA_FILES__', (Get-CommonFilesYaml $names)).
         Replace('__HOSTS__',   $hosts).
         Replace('__PUBKEY__',  $pub).
         Replace('__MAC__',     (Get-NodeMac $n.Ip)).
         Replace('__IP__',      $n.Ip).
-        Replace('__GW__',      $Gateway).
-        Replace('__K8S__',     $K8sMinor).
-        Replace('__CALICO__',  $CalicoVersion).
-        Replace('__PODCIDR__', $PodCidr).
-        Replace('__LABCIDR__', $LabCidr)
+        Replace('__GW__',      $Gateway)
 }
 
 function New-Nodes {
+    $versions = Get-LabVersions
+    $UbuntuImage = $versions.UBUNTU_VERSION
+    Write-Host "[vm] Versions (common\versions.env) : Ubuntu $UbuntuImage, Kubernetes $($versions.K8S_VERSION), Calico $($versions.CALICO_VERSION), Helm $($versions.HELM_VERSION)"
     $pub = (Get-Content "$SshKey.pub" -Raw).Trim()
     $existing = Get-MpInstances
     foreach ($n in $Nodes) {
@@ -516,7 +466,8 @@ function Set-AutoStart {
 }
 
 function Register-RepairTask {
-    $dst = Join-Path $LabRoot 'cka-lab.ps1'
+    New-Item -ItemType Directory -Force $RuntimeDir | Out-Null
+    $dst = Join-Path $RuntimeDir 'cka-lab.ps1'
     if ($PSCommandPath -ine $dst) { Copy-Item $PSCommandPath $dst -Force }
     $arg = "-NoProfile -ExecutionPolicy Bypass -File `"$dst`" -Action Repair -SwitchName $SwitchName -NetPrefix $NetPrefix -LabRoot `"$LabRoot`""
     $act = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arg
@@ -527,8 +478,8 @@ function Register-RepairTask {
 }
 
 function Initialize-Cluster {
-    Write-Host "[k8s] kubeadm init + Calico sur $($Cp.Name)"
-    Invoke-Mp exec $Cp.Name '--' sudo /usr/local/sbin/cka-init-cp.sh
+    Write-Host "[k8s] kubeadm init + Calico + Helm sur $($Cp.Name) (common\init-cp.sh)"
+    Invoke-Mp exec $Cp.Name '--' sudo bash /opt/cka/init-cp.sh $Cp.Ip $LabCidr
     $join = ((Get-MpOutput exec $Cp.Name '--' sudo kubeadm token create --print-join-command).Out -join ' ').Trim()
     if (-not $join.StartsWith('kubeadm join')) { throw "Commande de join invalide : $join" }
     foreach ($w in $Workers) {
@@ -604,6 +555,21 @@ function Show-Status {
     (Get-MpOutput list).Out
     Get-NetNat -Name $NatName -ErrorAction SilentlyContinue | Format-Table Name, InternalIPInterfaceAddressPrefix
     (Get-MpOutput exec $Cp.Name '--' kubectl get nodes -o wide).Out
+    ''
+    # Meme controle que le lab Hetzner : versions deployees vs common\versions.env
+    (Get-MpOutput exec $Cp.Name '--' bash /opt/cka/show-versions.sh).Out
+}
+
+# Charge realiste (common\cka-seed.sh) puis snapshot de reference
+function Invoke-Seed {
+    Write-Host "[seed] Copie de cka-seed.sh et versions.env sur $($Cp.Name)"
+    # Chemins relatifs volontaires : un chemin 'D:\...' risque d'etre lu comme 'instance:chemin'
+    Push-Location $CommonDir
+    try { Invoke-Mp transfer 'cka-seed.sh' 'versions.env' "$($Cp.Name):/home/ubuntu/" }
+    finally { Pop-Location }
+    Write-Host "[seed] Execution (5 a 10 minutes)"
+    Invoke-Mp exec $Cp.Name '--' bash /home/ubuntu/cka-seed.sh
+    Save-LabSnapshot
 }
 
 function Invoke-Repair {
@@ -628,7 +594,7 @@ function Remove-Lab {
     Remove-VMSwitch -Name $SwitchName -Force -ErrorAction SilentlyContinue
     Set-MarkedBlock "$env:SystemRoot\System32\drivers\etc\hosts" '' -Remove
     Set-MarkedBlock (Join-Path $HOME '.ssh\config') '' -Remove
-    Remove-Item $CiDir, $KubeDir, $LogDir -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item $CiDir, $KubeDir, $LogDir, $RuntimeDir -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item $SshConfig, $KnownHosts -Force -ErrorAction SilentlyContinue
     Write-Host "Lab supprime."
     Write-Host "Conserves dans $LabRoot : le script, la cle SSH, .vscode, et le stockage Multipass ($MpStorage, cache d'images)."
@@ -653,11 +619,17 @@ function New-Lab {
     Write-Host "  VS Code  : F1 > Remote-SSH: Connect to Host > $($Cp.Name)"
     Write-Host "  VS Code  : ouvre le dossier $LabRoot => terminal integre deja pointe sur le kubeconfig du lab"
     Write-Host "  kubectl  : `$env:KUBECONFIG=`"$KubeConfig`""
-    if (-not $NoSnapshot) { Write-Host "  Reset    : .\cka-lab.ps1 -Action Restore -SnapshotName $SnapshotName" }
+    Write-Host "  Seed     : .\hyperv\cka-lab.ps1 -Action Seed   (charge realiste + snapshot 'seeded')"
+    if (-not $NoSnapshot) { Write-Host "  Reset    : .\hyperv\cka-lab.ps1 -Action Restore -SnapshotName $SnapshotName" }
 }
 
 switch ($Action) {
     'Create'   { New-Lab }
+    'Seed'     {
+        if (-not $PSBoundParameters.ContainsKey('SnapshotName')) { $SnapshotName = 'seeded' }
+        Invoke-Seed
+    }
+    'RegisterTask' { Register-RepairTask }
     'Status'   { Show-Status }
     'Snapshot' { Save-LabSnapshot }
     'Restore'  { Restore-LabSnapshot }

@@ -1,0 +1,6 @@
+# Exemple pour un usage direct de Terraform (cka-hetzner.sh passe ces valeurs tout seul).
+# Copier en terraform.tfvars (ignore par Git). Le jeton n'a PAS sa place ici : variable d'environnement HCLOUD_TOKEN.
+admin_cidrs         = ["203.0.113.7/32"]
+location            = "fsn1"
+bastion_server_type = "cpx12"
+node_server_type    = "cpx22"
